@@ -34,6 +34,7 @@ chmod +x bootstrap.sh
   --target-dir /path/to/my-project \
   --claude-template ./templates/claude.md \
   --claude-rules-dir ./templates/rules \
+  --with-pytest \
   --with-github-workflows
 ```
 
@@ -48,7 +49,12 @@ Key flags:
 - `--project-name <name>`: override generated project name
 - `--python-version <version>`: default `3.14`
 - `--with-github-workflows`: adds `.github/workflows/ci.yml`
+- `--with-github-repo`: creates and pushes a repo via `gh` (default visibility: private)
+- `--github-repo-name <name>`
+- `--github-owner <owner>`
+- `--github-visibility <private|public>`
 - `--with-pre-commit` / `--without-pre-commit`
+- `--with-pytest` / `--without-pytest`
 - `--force`: overwrite managed files
 - `--claude-template <path>`
 - `--claude-rules-dir <path>`

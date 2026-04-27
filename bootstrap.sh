@@ -5,12 +5,17 @@ PROJECT_NAME=""
 PROJECT_SLUG=""
 PYTHON_VERSION="3.14"
 WITH_GITHUB_WORKFLOWS="false"
+WITH_GITHUB_REPO="false"
+GITHUB_REPO_NAME=""
+GITHUB_OWNER=""
+GITHUB_VISIBILITY="private"
 FORCE="false"
 TARGET_DIR="."
 CLAUDE_TEMPLATE=""
 CLAUDE_RULES_DIR=""
 CLAUDE_RULE_FILE=""
 WITH_PRECOMMIT="true"
+WITH_PYTEST="false"
 
 SCRIPT_NAME="$(basename "$0")"
 
@@ -23,8 +28,14 @@ Options:
   --target-dir <path>           Directory to initialize (default: current directory)
   --python-version <version>    Python version for uv and tool config (default: 3.14)
   --with-github-workflows       Generate GitHub Actions workflow under .github/workflows
+  --with-github-repo            Create and push a GitHub repo via gh (optional)
+  --github-repo-name <name>     GitHub repo name (default: project slug)
+  --github-owner <owner>        GitHub owner/org (optional, defaults to gh auth user)
+  --github-visibility <type>    private or public (default: private)
   --with-pre-commit             Configure and install pre-commit hooks (default: enabled)
   --without-pre-commit          Skip pre-commit setup
+  --with-pytest                 Add pytest dependency, tests scaffold, and CI test step
+  --without-pytest              Skip pytest scaffold (default)
   --force                       Overwrite existing managed files
   --claude-template <path>      Path to custom claude.md template to copy into ./claude.md
   --claude-rules-dir <path>     Path to directory with custom Claude rules copied into .claude/rules/
@@ -152,12 +163,36 @@ parse_args() {
         WITH_GITHUB_WORKFLOWS="true"
         shift
         ;;
+      --with-github-repo)
+        WITH_GITHUB_REPO="true"
+        shift
+        ;;
+      --github-repo-name)
+        GITHUB_REPO_NAME="${2:-}"
+        shift 2
+        ;;
+      --github-owner)
+        GITHUB_OWNER="${2:-}"
+        shift 2
+        ;;
+      --github-visibility)
+        GITHUB_VISIBILITY="${2:-}"
+        shift 2
+        ;;
       --with-pre-commit)
         WITH_PRECOMMIT="true"
         shift
         ;;
       --without-pre-commit)
         WITH_PRECOMMIT="false"
+        shift
+        ;;
+      --with-pytest)
+        WITH_PYTEST="true"
+        shift
+        ;;
+      --without-pytest)
+        WITH_PYTEST="false"
         shift
         ;;
       --force)
@@ -192,6 +227,9 @@ parse_args() {
 validate_inputs() {
   require_cmd uv
   require_cmd git
+  if [[ "$WITH_GITHUB_REPO" == "true" ]]; then
+    require_cmd gh
+  fi
 
   TARGET_DIR="$(absolute_path "$TARGET_DIR")"
   mkdir -p "$TARGET_DIR"
@@ -215,6 +253,15 @@ validate_inputs() {
   PROJECT_SLUG="$(printf '%s' "$PROJECT_NAME" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
   if [[ -z "$PROJECT_SLUG" ]]; then
     PROJECT_SLUG="python-project"
+  fi
+
+  if [[ -z "$GITHUB_REPO_NAME" ]]; then
+    GITHUB_REPO_NAME="$PROJECT_SLUG"
+  fi
+
+  if [[ "$GITHUB_VISIBILITY" != "private" && "$GITHUB_VISIBILITY" != "public" ]]; then
+    printf '[bootstrap][error] --github-visibility must be "private" or "public"\n' >&2
+    exit 1
   fi
 
   if [[ -n "$CLAUDE_TEMPLATE" && ! -f "$CLAUDE_TEMPLATE" ]]; then
@@ -260,6 +307,19 @@ PY
 }
 
 write_readme() {
+  local testing_section=""
+  if [[ "$WITH_PYTEST" == "true" ]]; then
+    testing_section=$(cat <<'TXT'
+
+## Run Tests
+
+```bash
+uv run pytest
+```
+TXT
+)
+  fi
+
   local content
   content=$(cat <<EOF2
 # $PROJECT_NAME
@@ -283,6 +343,7 @@ uv run ruff format .
 uv run ruff check .
 uv run mypy .
 \`\`\`
+$testing_section
 EOF2
 )
   write_file "README.md" "$content"
@@ -304,6 +365,11 @@ TXT
 }
 
 write_pyproject() {
+  local pytest_dep=""
+  if [[ "$WITH_PYTEST" == "true" ]]; then
+    pytest_dep='  "pytest",'
+  fi
+
   local content
   content=$(cat <<EOF2
 [project]
@@ -319,6 +385,7 @@ dev = [
   "ruff",
   "mypy",
   "pre-commit",
+$pytest_dep
 ]
 
 [tool.ruff]
@@ -348,6 +415,34 @@ show_error_codes = true
 EOF2
 )
   write_file "pyproject.toml" "$content"
+}
+
+setup_pytest() {
+  if [[ "$WITH_PYTEST" != "true" ]]; then
+    return
+  fi
+
+  mkdir -p tests
+  local test_content
+  test_content=$(cat <<'PY'
+"""Basic tests for the starter app."""
+
+import subprocess
+import sys
+
+
+def test_main_script_runs() -> None:
+    """Ensure the starter entry point executes and prints the expected message."""
+    result = subprocess.run(
+        [sys.executable, "main.py"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    assert result.stdout.strip() == "Hello from your uv-managed Python project!"
+PY
+)
+  write_file "tests/test_main.py" "$test_content"
 }
 
 setup_claude() {
@@ -452,8 +547,13 @@ YAML
 )
   write_file ".pre-commit-config.yaml" "$config"
 
-  uv run pre-commit install >/dev/null
-  log "Installed pre-commit hooks"
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    uv run pre-commit install >/dev/null
+    log "Installed pre-commit hooks"
+  else
+    warn "Skipped pre-commit hook install (not a git repository yet)."
+    warn "Run 'uv run pre-commit install' after initializing git."
+  fi
 }
 
 write_editorconfig() {
@@ -519,7 +619,45 @@ jobs:
 YAML
 )
 
+  if [[ "$WITH_PYTEST" == "true" ]]; then
+    ci_workflow+=$'\n\n      - name: Pytest\n        run: uv run pytest\n'
+  fi
+
   write_file ".github/workflows/ci.yml" "$ci_workflow"
+}
+
+setup_github_repo() {
+  if [[ "$WITH_GITHUB_REPO" != "true" ]]; then
+    return
+  fi
+
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git init >/dev/null
+    log "Initialized git repository"
+  fi
+
+  git add .
+  if ! git diff --cached --quiet; then
+    if ! git commit -m "Bootstrap project" >/dev/null 2>&1; then
+      warn "Could not create git commit automatically. Check git user.name/user.email."
+    else
+      log "Created initial commit"
+    fi
+  fi
+  git branch -M main
+
+  if git remote get-url origin >/dev/null 2>&1; then
+    warn "Remote 'origin' already exists. Skipping gh repo create."
+    return
+  fi
+
+  local repo_ref="$GITHUB_REPO_NAME"
+  if [[ -n "$GITHUB_OWNER" ]]; then
+    repo_ref="$GITHUB_OWNER/$GITHUB_REPO_NAME"
+  fi
+
+  gh repo create "$repo_ref" "--$GITHUB_VISIBILITY" --source=. --remote=origin --push >/dev/null
+  log "Created and pushed GitHub repository: $repo_ref"
 }
 
 print_next_steps() {
@@ -532,7 +670,8 @@ Next steps:
   2. uv run ruff check .
   3. uv run mypy .
   4. uv run pre-commit run --all-files
-  5. git add . && git commit -m "Bootstrap project"
+  5. uv run pytest (if --with-pytest was used)
+  6. git add . && git commit -m "Bootstrap project"
 EOF2
 }
 
@@ -548,8 +687,10 @@ main() {
   write_gitignore
   write_editorconfig
   setup_claude
+  setup_pytest
   setup_precommit
   setup_github_workflow
+  setup_github_repo
   print_next_steps
 }
 
